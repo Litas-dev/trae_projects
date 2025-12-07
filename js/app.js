@@ -989,7 +989,7 @@ function createPostElement(post) {
                     <div class="post-handle">@${authorHandle} • ${postTime}</div>
                 </div>
             </div>
-            ${post.authorId === currentUser.uid ? `<div style="position: relative;"><button class="post-menu" onclick="togglePostMenu('${post.postId}')" title="Menu">⋯</button><div class="post-menu-dropdown" id="menu-${post.postId}" style="display: none;"><button class="menu-option" onclick="editPost('${post.postId}')">✏️ Edit</button><button class="menu-option delete" onclick="confirmDeletePost('${post.postId}')">🗑️ Delete</button></div></div>` : ''}
+            ${post.authorId === currentUser.uid ? `<div style="position: relative;"><button class="post-menu" data-postid="${post.postId}" title="Menu">⋯</button><div class="post-menu-dropdown" id="menu-${post.postId}" style="display: none;"><button class="menu-option" onclick="editPost('${post.postId}')">✏️ Edit</button><button class="menu-option delete" onclick="confirmDeletePost('${post.postId}')">🗑️ Delete</button></div></div>` : ''}
         </div>
         <div class="post-content">${formatPostContent(post.content)}</div>
         <div class="post-stats">
@@ -1198,13 +1198,184 @@ function submitComment(postId) {
  * Delete a post (only author can delete)
  */
 function deletePost(postId) {
-    if (!confirm('Are you sure you want to delete this post?')) return;
+    if (!currentUser) {
+        alert('Please sign in first');
+        return;
+    }
 
-    database.ref('posts/' + postId).remove().then(() => {
-        alert('Post deleted');
-        switchFeed('home');
-    }).catch(err => console.error('Error deleting post:', err));
+    // Verify ownership before deleting
+    database.ref('posts/' + postId).once('value').then(snapshot => {
+        if (!snapshot.exists()) {
+            alert('Post not found');
+            return;
+        }
+
+        const post = snapshot.val();
+        if (post.authorId !== currentUser.uid) {
+            alert('You can only delete your own posts');
+            return;
+        }
+
+        // Actually remove the post
+        database.ref('posts/' + postId).remove().then(() => {
+            alert('Post deleted');
+            switchFeed('home');
+        }).catch(err => console.error('Error deleting post:', err));
+    }).catch(err => {
+        console.error('Error verifying post ownership:', err);
+        alert('Error deleting post');
+    });
 }
+
+/**
+ * Toggle the post menu dropdown (three-dots menu)
+ */
+function togglePostMenu(postId) {
+    const menuId = 'menu-' + postId;
+    const menu = document.getElementById(menuId);
+    if (!menu) return;
+
+    // Close any other open menus first
+    document.querySelectorAll('.post-menu-dropdown').forEach(m => {
+        if (m.id !== menuId) m.style.display = 'none';
+    });
+
+    // Toggle this menu
+    if (menu.style.display === 'block') {
+        menu.style.display = 'none';
+    } else {
+        menu.style.display = 'block';
+    }
+}
+
+/**
+ * Confirm deletion flow for a post (shows prompt then calls delete)
+ */
+function confirmDeletePost(postId) {
+    const ok = confirm('Delete this post? This cannot be undone.');
+    if (ok) {
+        deletePost(postId);
+    }
+}
+
+/**
+ * Edit a post's content in-place (simple prompt editor)
+ */
+function editPost(postId) {
+    if (!currentUser) {
+        alert('Please sign in first');
+        return;
+    }
+
+    // Load current post content
+    database.ref('posts/' + postId).once('value').then(snapshot => {
+        if (!snapshot.exists()) {
+            alert('Post not found');
+            return;
+        }
+
+        const post = snapshot.val();
+        if (post.authorId !== currentUser.uid) {
+            alert('You can only edit your own posts');
+            return;
+        }
+
+        const newContent = prompt('Edit your post:', post.content);
+        if (newContent === null) return; // user cancelled
+
+        const trimmed = newContent.trim();
+        if (!trimmed) {
+            alert('Post content cannot be empty');
+            return;
+        }
+
+        const oldHashtags = post.hashtags || [];
+        const newHashtags = extractHashtags(trimmed);
+
+        // Update post content and hashtags
+        database.ref('posts/' + postId).update({ content: trimmed, hashtags: newHashtags }).then(() => {
+            // Update hashtags index: decrement old, increment new
+            // Decrement counts for tags removed
+            oldHashtags.forEach(tag => {
+                if (!newHashtags.includes(tag)) {
+                    const tagName = tag.substring(1);
+                    database.ref('hashtags/' + tagName).once('value').then(snap => {
+                        if (snap.exists()) {
+                            const data = snap.val();
+                            data.count = Math.max(0, (data.count || 1) - 1);
+                            if (data.posts) delete data.posts[postId];
+                            database.ref('hashtags/' + tagName).set(data);
+                        }
+                    });
+                }
+            });
+
+            // Increment counts for new tags added
+            newHashtags.forEach(tag => {
+                if (!oldHashtags.includes(tag)) {
+                    const tagName = tag.substring(1);
+                    database.ref('hashtags/' + tagName).once('value').then(snap => {
+                        const current = snap.val() || { count: 0, posts: {} };
+                        current.count = (current.count || 0) + 1;
+                        current.posts = current.posts || {};
+                        current.posts[postId] = true;
+                        database.ref('hashtags/' + tagName).set(current);
+                    });
+                }
+            });
+
+            alert('Post updated');
+            // Close menu and refresh feed
+            const menu = document.getElementById('menu-' + postId);
+            if (menu) menu.style.display = 'none';
+            switchFeed('home');
+            loadTrendingTags();
+        }).catch(err => {
+            console.error('Error updating post:', err);
+            alert('Error updating post');
+        });
+    }).catch(err => {
+        console.error('Error loading post for edit:', err);
+        alert('Error loading post');
+    });
+}
+
+// Close post menus when clicking outside (safe against text-node targets)
+document.addEventListener('click', (e) => {
+    let el = e.target;
+    // If the target is a text node, climb to its parent element
+    while (el && el.nodeType !== 1) {
+        el = el.parentNode;
+    }
+    if (!el) return;
+
+    if (!el.closest('.post-menu') && !el.closest('.post-menu-dropdown')) {
+        document.querySelectorAll('.post-menu-dropdown').forEach(m => m.style.display = 'none');
+    }
+});
+
+// Delegated handler so dynamically-created post-menu buttons always work
+document.addEventListener('click', (e) => {
+    let el = e.target;
+    while (el && el.nodeType !== 1) el = el.parentNode;
+    if (!el) return;
+
+    const menuBtn = el.closest('.post-menu');
+    if (menuBtn) {
+        // Find enclosing post element to extract postId
+        const postEl = menuBtn.closest('.post');
+        if (!postEl || !postEl.id) return;
+        const idParts = postEl.id.split('-');
+        const postId = idParts.slice(1).join('-');
+        if (!postId) return;
+
+        // Prevent the outside click handler from immediately closing it
+        e.stopPropagation();
+
+        // Toggle menu
+        togglePostMenu(postId);
+    }
+});
 
 /**
  * Create a new post - Saves to Firebase
